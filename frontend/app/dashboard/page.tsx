@@ -114,7 +114,7 @@ export default function DashboardPage() {
             <Stat label="Completion rate" value={live.completion_rate === null ? "—" : `${live.completion_rate}%`} note="Excludes tasks stopped by policy or an approver" />
             <Stat label="Stopped by governance" value={(live.by_status.blocked ?? 0) + (live.by_status.rejected ?? 0)} note={`${live.by_status.blocked ?? 0} blocked, ${live.by_status.rejected ?? 0} rejected`} />
             <Stat label="Unauthorized executions" value={live.unauthorized_executions} note="Target: 0" />
-            <Stat label="High-risk calls approved" value={`${live.high_risk_with_approval}/${live.high_risk_executed}`} note="Target: all" />
+            <Stat label="High-risk calls authorized" value={`${live.high_risk_with_approval}/${live.high_risk_executed}`} note="By approval, task grant or allow rule. Target: all" />
             <Stat label="Failed tool calls" value={live.failed} note={`${live.retried} needed a retry`} />
             <Stat label="Average task time" value={live.average_duration_seconds === null ? "—" : `${live.average_duration_seconds}s`} note="Includes time waiting for people" />
             <Stat label="Audit log" value={live.audit_chain.valid ? "Intact" : "BROKEN"} note={`${live.audit_chain.events} chained events`} />

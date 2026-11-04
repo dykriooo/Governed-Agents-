@@ -9,7 +9,10 @@ export type Approval = {
   reasons: { policy: string; why: string }[]; required_role: string; status: string;
   decided_by: string | null; decided_at: string | null; note: string | null;
   review: Record<string, any> | null; requested_by?: string | null; instruction?: string | null;
+  scope: "once" | "task" | "always" | null; scopes: ("once" | "task" | "always")[]; irreversible: boolean; grant_target: string;
 };
+
+export const SCOPE_LABEL = { once: "once", task: "for this task", always: "always" } as const;
 
 function ReviewValues({ review }: { review: Record<string, any> }) {
   const { url, fields, ...rest } = review;
@@ -38,11 +41,11 @@ export function ApprovalCard({ approval, onDecided, requester }: { approval: App
   const enoughAuthority = (rank[user.role] ?? 0) >= (rank[approval.required_role] ?? 2);
   const canDecide = enoughAuthority && !isOwner;
 
-  async function decide(approve: boolean) {
+  async function decide(approve: boolean, scope: string = "once") {
     setBusy(true);
     setError(null);
     try {
-      await api(`/approvals/${approval.id}/decision`, { method: "POST", json: { approve, note: note || null } });
+      await api(`/approvals/${approval.id}/decision`, { method: "POST", json: { approve, scope, note: note || null } });
       onDecided();
     } catch (e) {
       setError((e as Error).message);
@@ -71,9 +74,20 @@ export function ApprovalCard({ approval, onDecided, requester }: { approval: App
           </Field>
           <ErrorNote>{error}</ErrorNote>
           <div className="flex flex-wrap gap-2">
-            <Button disabled={busy} onClick={() => decide(true)}>Approve and continue</Button>
+            <Button disabled={busy} onClick={() => decide(true, "once")}>Allow once</Button>
+            {approval.scopes.includes("task") && <Button disabled={busy} variant="secondary" onClick={() => decide(true, "task")}>Allow for this task</Button>}
+            {approval.scopes.includes("always") && <Button disabled={busy} variant="secondary" onClick={() => decide(true, "always")}>Always allow</Button>}
             <Button disabled={busy} variant="danger" onClick={() => decide(false)}>Reject</Button>
           </div>
+          {approval.irreversible ? (
+            <p className="text-xs text-muted">This can't be undone, so it's approved one at a time.</p>
+          ) : (
+            <p className="text-xs text-muted">
+              Wider options cover <span className="font-medium">{approval.grant_target}</span>.
+              {approval.scopes.includes("always") && " Always allow adds a rule you can remove on the Policies page."}
+              {" "}Hard denies still apply.
+            </p>
+          )}
         </div>
       ) : (
         <p className="mt-4 text-sm text-muted">

@@ -12,6 +12,9 @@ type Rule = {
 
 function describeCondition(c: Condition) {
   if (c.op === "domain_not_in") return "destination isn't on the approved list";
+  if (c.op === "domain_in") return `destination is ${(c.value as string[]).join(" or ")}`;
+  if (c.op === "eq") return `${c.field.replace("args.", "")} is ${c.value}`;
+  if (c.op === "lte") return `${c.field.replace("args.", "")} is at most ${Number(c.value).toLocaleString()}`;
   if (c.op === "contains_pii") return "the call contains personal data";
   if (c.op === "not_actor") return "the data belongs to another user";
   if (c.op === "gt") return `${c.field.replace("args.", "")} is above ${Number(c.value).toLocaleString()}`;
@@ -65,7 +68,9 @@ function RuleCard({ rule, isAdmin, refresh }: { rule: Rule; isAdmin: boolean; re
     <Card className={rule.enabled ? "" : "opacity-60"}>
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="font-semibold">{rule.name}</h3>
-        {rule.effect === "deny" ? <Badge tone="bad" icon="⊘">{rule.hard ? "Hard deny" : "Deny"}</Badge> : <Badge tone="warn" icon="!">{rule.required_role === "admin" ? "Needs admin approval" : "Needs approval"}</Badge>}
+        {rule.effect === "deny" && <Badge tone="bad" icon="⊘">{rule.hard ? "Hard deny" : "Deny"}</Badge>}
+        {rule.effect === "require_approval" && <Badge tone="warn" icon="!">{rule.required_role === "admin" ? "Ask an admin" : "Ask"}</Badge>}
+        {rule.effect === "allow" && <Badge tone="good" icon="✓">Allow</Badge>}
         {rule.locked && <Badge icon="🔒">Locked</Badge>}
         {!rule.enabled && <Badge>Off</Badge>}
       </div>
@@ -84,6 +89,116 @@ function RuleCard({ rule, isAdmin, refresh }: { rule: Rule; isAdmin: boolean; re
         </div>
       )}
     </Card>
+  );
+}
+
+type ToolInfo = { name: string; description: string; tags: string[] };
+const IRREVERSIBLE = ["submission", "payment"];
+const CONDITIONS: Record<string, { label: string; effects: string[]; input?: string }> = {
+  always: { label: "Every call", effects: ["deny", "require_approval", "allow"] },
+  host_is: { label: "Destination is", effects: ["deny", "require_approval", "allow"], input: "host or host:port, comma separated" },
+  amount_above: { label: "Amount is above", effects: ["deny", "require_approval"], input: "amount in ₹" },
+  amount_at_most: { label: "Amount is at most", effects: ["allow"], input: "amount in ₹" },
+  pii: { label: "Contains personal data", effects: ["deny", "require_approval"] },
+};
+
+function buildConditions(kind: string, value: string): Condition[] {
+  if (kind === "host_is") return [{ field: "args.url", op: "domain_in", value: value.split(",").map((d) => d.trim()).filter(Boolean) }];
+  if (kind === "amount_above") return [{ field: "args.amount", op: "gt", value: Number(value) }];
+  if (kind === "amount_at_most") return [{ field: "args.amount", op: "lte", value: Number(value) }];
+  if (kind === "pii") return [{ field: "args", op: "contains_pii" }];
+  return [];
+}
+
+function RuleBuilder({ onCreated }: { onCreated: () => void }) {
+  const { data: tools } = usePolling<ToolInfo[]>("/tools", 600000);
+  const [effect, setEffect] = useState("require_approval");
+  const [tool, setTool] = useState("");
+  const [kind, setKind] = useState("always");
+  const [value, setValue] = useState("");
+  const [role, setRole] = useState("approver");
+  const [name, setName] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const available = (tools ?? []).filter((t) => effect !== "allow" || !t.tags.some((tag) => IRREVERSIBLE.includes(tag)));
+  const kinds = Object.entries(CONDITIONS).filter(([, c]) => c.effects.includes(effect));
+  const needsValue = CONDITIONS[kind]?.input;
+
+  function chooseEffect(next: string) {
+    setEffect(next);
+    if (!CONDITIONS[kind].effects.includes(next)) setKind("always");
+    if (next === "allow" && available.every((t) => t.name !== tool)) setTool("");
+    if (next === "allow" && tools?.find((t) => t.name === tool)?.tags.some((tag) => IRREVERSIBLE.includes(tag))) setTool("");
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    try {
+      await api("/policies", {
+        method: "POST",
+        json: {
+          name, effect, description: name, required_role: role, hard: effect === "deny",
+          match: { tools: [tool] }, conditions: buildConditions(kind, value),
+        },
+      });
+      setName("");
+      setValue("");
+      setKind("always");
+      onCreated();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="When the agent uses">
+          <select required className={inputClass} value={tool} onChange={(e) => setTool(e.target.value)}>
+            <option value="">Choose a tool…</option>
+            {available.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
+          </select>
+        </Field>
+        <Field label="And">
+          <select className={inputClass} value={kind} onChange={(e) => setKind(e.target.value)}>
+            {kinds.map(([key, c]) => <option key={key} value={key}>{c.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Then">
+          <select className={inputClass} value={effect} onChange={(e) => chooseEffect(e.target.value)}>
+            <option value="require_approval">Ask for approval</option>
+            <option value="deny">Deny</option>
+            <option value="allow">Allow without asking</option>
+          </select>
+        </Field>
+      </div>
+      {needsValue && (
+        <Field label={CONDITIONS[kind].label} hint={needsValue}>
+          <input required className={inputClass} value={value} type={kind.startsWith("amount") ? "number" : "text"} min={0} onChange={(e) => setValue(e.target.value)} />
+        </Field>
+      )}
+      {effect === "require_approval" && (
+        <Field label="Who can approve">
+          <select className={inputClass} value={role} onChange={(e) => setRole(e.target.value)}>
+            <option value="approver">Approver or administrator</option>
+            <option value="admin">Administrator only</option>
+          </select>
+        </Field>
+      )}
+      <Field label="Rule name">
+        <input required minLength={3} maxLength={120} className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <p className="text-xs text-muted">
+        {effect === "allow"
+          ? "Deny and ask rules still win over this. Submissions and payments aren't listed because they always need a person."
+          : effect === "deny"
+            ? "A deny can't be overridden by approval, and it wins over every other rule."
+            : "An ask rule wins over allow rules. Only a deny outranks it."}
+      </p>
+      <ErrorNote>{error}</ErrorNote>
+      <Button type="submit">Add rule</Button>
+    </form>
   );
 }
 
@@ -120,8 +235,11 @@ function NewPolicy({ onCreated }: { onCreated: () => void }) {
 
   return (
     <Card className="mb-6">
+      <h2 className="mb-3 font-semibold">Add a custom rule</h2>
+      <RuleBuilder onCreated={onCreated} />
+      <div className="my-5 border-t border-line" />
       <form onSubmit={compile} className="space-y-3">
-        <Field label="Add a policy in plain language">
+        <Field label="Or describe it in plain language">
           <input className={inputClass} value={text} onChange={(e) => setText(e.target.value)} minLength={3} required placeholder="Do not make payments above ₹2,000" />
         </Field>
         <Button type="submit" variant="secondary">Translate to a rule</Button>
@@ -145,7 +263,7 @@ export default function PoliciesPage() {
   const { data, error, refresh } = usePolling<Rule[]>("/policies", 15000);
   return (
     <>
-      <PageTitle title="Policies" subtitle="Every tool call is checked against these rules before it runs. Rules can only add restrictions, and high-risk actions always need approval, whatever is configured here." />
+      <PageTitle title="Policies" subtitle="Every tool call is checked against these rules before it runs. Deny beats ask, and ask beats allow. Submissions and payments always need a person's approval, whatever is configured here." />
       {isAdmin && <NewPolicy onCreated={refresh} />}
       <ErrorNote>{error}</ErrorNote>
       <div className="space-y-3">

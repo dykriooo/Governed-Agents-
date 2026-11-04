@@ -15,7 +15,7 @@ from . import audit, engine, evaluation, planner, policy
 from .config import settings
 from .db import Approval, AuditEvent, Document, EvalReport, Policy, Run, ToolCall, User, init_db, session_scope
 from .security import create_token, decrypt, encrypt, hash_password, read_token, verify_password
-from .tools import catalog
+from .tools import REGISTRY, catalog
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples"
 MAX_UPLOAD_BYTES = 1_000_000
@@ -184,8 +184,13 @@ def _can_see_review_data(run: Run, user: dict) -> bool:
     return run.owner_id == user["id"] or user["role"] in policy.ROLE_RANK
 
 
-def _approval_row(approval: Approval, include_review: bool, run: Run | None = None, owner: str | None = None) -> dict:
+def _approval_row(approval: Approval, include_review: bool, user: dict, run: Run | None = None, owner: str | None = None) -> dict:
+    scopes = engine.approval_scopes(approval)
     return {
+        "scope": approval.scope,
+        "scopes": [scope for scope in scopes if scope != "always" or user["role"] == "admin"],
+        "irreversible": scopes == ["once"],
+        "grant_target": engine.grant_target(approval),
         "id": approval.id, "run_id": approval.run_id, "tool": approval.tool, "summary": approval.summary,
         "consequences": approval.consequences, "risk": approval.risk, "reasons": approval.reasons,
         "required_role": approval.required_role, "status": approval.status, "decided_by": approval.decided_by,
@@ -221,7 +226,7 @@ def get_run(run_id: str, user: dict = Depends(current_user)):
                  "output": c.output, "error": c.error, "duration_ms": c.duration_ms, "created_at": iso(c.created_at)}
                 for c in calls
             ],
-            "approvals": [_approval_row(a, _can_see_review_data(run, user)) for a in approvals],
+            "approvals": [_approval_row(a, _can_see_review_data(run, user), user) for a in approvals],
             "audit": [_event_row(event) for event in events],
         }
 
@@ -250,17 +255,18 @@ def list_approvals(status: str = "pending", user: dict = Depends(require_role("a
             .join(Run, Run.id == Approval.run_id).join(User, User.id == Run.owner_id)
             .where(Approval.status == status, Run.is_eval.is_(False)).order_by(Approval.created_at.desc()).limit(100)
         )
-        return [_approval_row(a, user["role"] in policy.ROLE_RANK, run, owner) for a, run, owner in rows]
+        return [_approval_row(a, user["role"] in policy.ROLE_RANK, user, run, owner) for a, run, owner in rows]
 
 
 class DecisionIn(BaseModel):
     approve: bool
     note: str | None = Field(default=None, max_length=500)
+    scope: str = "once"
 
 
 @app.post("/approvals/{approval_id}/decision")
 def decide(approval_id: str, body: DecisionIn, user: dict = Depends(current_user)):
-    return engine.decide_approval(approval_id, user, body.approve, body.note)
+    return engine.decide_approval(approval_id, user, body.approve, body.note, body.scope)
 
 
 def _policy_row(rule: Policy) -> dict:
@@ -270,6 +276,18 @@ def _policy_row(rule: Policy) -> dict:
         "conditions": rule.conditions, "required_role": rule.required_role, "created_by": rule.created_by,
         "created_at": iso(rule.created_at),
     }
+
+
+def _rule_problem(values: dict) -> str | None:
+    """Checks that need the tool registry, on top of policy.validate_rule."""
+    if problem := policy.validate_rule(values):
+        return problem
+    named = (values.get("match") or {}).get("tools") or []
+    if unknown := [name for name in named if name not in REGISTRY]:
+        return f"Unknown tool: {', '.join(unknown)}"
+    if values.get("effect") == "allow" and any(REGISTRY[name].tags & policy.IRREVERSIBLE_TAGS for name in named):
+        return "Submissions and payments can't be always allowed. They need a person's approval every time."
+    return None
 
 
 @app.get("/policies")
@@ -309,7 +327,7 @@ class PolicyIn(BaseModel):
 @app.post("/policies", status_code=201)
 def create_policy(body: PolicyIn, user: dict = Depends(require_role("admin"))):
     values = body.model_dump()
-    if problem := policy.validate_rule(values):
+    if problem := _rule_problem(values):
         raise HTTPException(422, problem)
     with session_scope() as session:
         rule = Policy(**values, created_by=user["username"])
@@ -335,7 +353,7 @@ def update_policy(policy_id: str, body: PolicyPatch, user: dict = Depends(requir
         if body.enabled is False and rule.locked:
             raise HTTPException(409, "This is a locked safety policy and can't be disabled")
         if body.conditions is not None:
-            if problem := policy.validate_rule({"effect": rule.effect, "conditions": body.conditions}):
+            if problem := _rule_problem({"effect": rule.effect, "match": rule.match, "conditions": body.conditions}):
                 raise HTTPException(422, problem)
             rule.conditions = body.conditions
         if body.enabled is not None:

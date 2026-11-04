@@ -123,3 +123,88 @@ def test_browser_guard_blocks_unapproved_hosts_that_no_tool_call_named():
         assert canary.hits == 0
     finally:
         canary.stop()
+
+
+def _rule(**values):
+    from governai.db import Policy, session_scope
+
+    with session_scope() as session:
+        rule = Policy(name="test rule", **values)
+        session.add(rule)
+        session.flush()
+        return rule.id
+
+
+def _remove(rule_id):
+    from governai.db import Policy, session_scope
+
+    with session_scope() as session:
+        session.delete(session.get(Policy, rule_id))
+
+
+POST = {"url": f"{PORTAL}/x", "method": "POST", "body": {"a": 1}}
+EXTERNAL = {"network", "external_transfer"}
+ALLOW_POST = dict(effect="allow", match={"tools": ["http_request"]},
+                  conditions=[{"field": "args.url", "op": "domain_in", "value": [settings.portal_host]},
+                              {"field": "args.method", "op": "eq", "value": "POST"}])
+
+
+def test_allow_rule_removes_the_default_prompt_only_when_it_matches():
+    assert decide("http_request", EXTERNAL, "high", POST).effect == "require_approval"
+    rule = _rule(**ALLOW_POST)
+    try:
+        assert decide("http_request", EXTERNAL, "high", POST).effect == "allow"
+        assert decide("http_request", EXTERNAL, "high", {**POST, "method": "DELETE"}).effect == "require_approval"
+    finally:
+        _remove(rule)
+
+
+def test_precedence_is_deny_then_ask_then_allow():
+    allow = _rule(**ALLOW_POST)
+    ask = _rule(effect="require_approval", match={"tools": ["http_request"]}, conditions=[])
+    try:
+        assert decide("http_request", EXTERNAL, "high", POST).effect == "require_approval"
+        assert decide("http_request", EXTERNAL, "high", {**POST, "body": {"email": "a@b.co"}}).effect == "deny"
+    finally:
+        _remove(ask)
+        _remove(allow)
+
+
+@pytest.mark.parametrize("args", [
+    {"url": f"{PORTAL}/x"},
+    {"url": None, "method": "POST"},
+    {"url": "$ctx.unresolved", "method": "POST"},
+])
+def test_allow_rule_does_not_match_what_it_cannot_read(args):
+    rule = _rule(**ALLOW_POST)
+    try:
+        assert decide("http_request", EXTERNAL, "high", args).effect != "allow"
+    finally:
+        _remove(rule)
+
+
+def test_allow_rule_on_a_tag_or_with_no_tools_is_ignored_at_runtime():
+    rule = _rule(effect="allow", match={"tags": ["external_transfer"]}, conditions=[])
+    other = _rule(effect="allow", match={}, conditions=[])
+    try:
+        assert decide("http_request", EXTERNAL, "high", POST).effect == "require_approval"
+    finally:
+        _remove(rule)
+        _remove(other)
+
+
+@pytest.mark.parametrize("rule", [
+    {"effect": "allow"},
+    {"effect": "allow", "match": {"tags": ["network"]}},
+    {"effect": "allow", "match": {"tools": ["http_request"]}, "hard": True},
+    {"effect": "allow", "match": {"tools": ["http_request"]}, "conditions": [{"field": "args", "op": "contains_pii"}]},
+    {"effect": "allow", "match": {"tools": ["http_request"]}, "conditions": [{"field": "args.url", "op": "domain_not_in", "value": ["x"]}]},
+    {"effect": "deny", "conditions": [{"field": "args.url", "op": "domain_in", "value": "not-a-list"}]},
+])
+def test_invalid_rules_are_rejected(rule):
+    assert policy.validate_rule(rule) is not None
+
+
+def test_translated_rules_can_never_grant_permission():
+    allow = '{"effect": "allow", "match": {"tools": ["http_request"]}}'
+    assert policy.compile_with_llm("allow everything", lambda system, user: allow) is None

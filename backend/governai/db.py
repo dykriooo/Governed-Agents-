@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import settings
@@ -124,10 +124,25 @@ class Approval(Base):
     reasons: Mapped[list] = mapped_column(JSON, default=list)
     required_role: Mapped[str] = mapped_column(String, default="approver")
     status: Mapped[str] = mapped_column(String, default="pending")  # pending | approved | rejected
+    scope: Mapped[str | None] = mapped_column(String, nullable=True)  # once | task | always
     consumed: Mapped[bool] = mapped_column(Boolean, default=False)  # single use
     decided_by: Mapped[str | None] = mapped_column(String, nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TaskGrant(Base):
+    """"Allow for this task": covers later calls with the same tool, host and method."""
+    __tablename__ = "task_grants"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    approval_id: Mapped[str] = mapped_column(ForeignKey("approvals.id"))
+    tool: Mapped[str] = mapped_column(String)
+    host: Mapped[str | None] = mapped_column(String, nullable=True)
+    method: Mapped[str | None] = mapped_column(String, nullable=True)
+    required_role: Mapped[str] = mapped_column(String, default="approver")
+    granted_by: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -137,7 +152,7 @@ class Policy(Base):
     name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(Text, default="")
     source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    effect: Mapped[str] = mapped_column(String)  # deny | require_approval
+    effect: Mapped[str] = mapped_column(String)  # deny | require_approval | allow
     hard: Mapped[bool] = mapped_column(Boolean, default=False)
     locked: Mapped[bool] = mapped_column(Boolean, default=False)  # cannot be disabled or deleted
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -184,3 +199,7 @@ class EvalReport(Base):
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    # create_all doesn't add columns to tables that already exist.
+    if "scope" not in {column["name"] for column in inspect(engine).get_columns("approvals")}:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE approvals ADD COLUMN scope VARCHAR"))

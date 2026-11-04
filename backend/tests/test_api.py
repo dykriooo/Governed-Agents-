@@ -224,3 +224,63 @@ def test_an_approval_authorizes_only_one_execution(client, tokens):
     client.post(f"/approvals/{approval['id']}/decision", headers=tokens["approver"], json={"approve": True})
     assert wait(client, tokens["student"], run_id, {"completed", "failed"})["status"] == "completed"
     assert engine._consume_approval(run_id, step_index, "submit_form", args_hash, "approver") is None
+
+
+def test_custom_ask_rule_offers_task_scope_but_not_always(client, tokens):
+    created = client.post("/policies", headers=tokens["admin"], json={
+        "name": "Ask before filling forms", "effect": "require_approval", "match": {"tools": ["fill_form"]}, "conditions": []})
+    assert created.status_code == 201, created.text
+    try:
+        run_id = start(client, tokens)
+        run = wait(client, tokens["student"], run_id, {"awaiting_approval"})
+        assert run["approvals"][0]["tool"] == "fill_form"
+        admin_view = client.get(f"/runs/{run_id}", headers=tokens["admin"]).json()["approvals"][0]
+        assert admin_view["scopes"] == ["once", "task"]  # an ask rule outranks allow rules, so "always" would do nothing
+        decide = f"/approvals/{admin_view['id']}/decision"
+        assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "always"}).status_code == 409
+        assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "bogus"}).status_code == 409
+        assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "task"}).status_code == 200
+        deadline = time.monotonic() + 30
+        pending = []
+        while not pending and time.monotonic() < deadline:
+            time.sleep(0.1)
+            run = client.get(f"/runs/{run_id}", headers=tokens["student"]).json()
+            pending = [a for a in run["approvals"] if a["status"] == "pending"]
+        assert pending and pending[0]["tool"] == "submit_form"
+        assert pending[0]["scopes"] == ["once"] and pending[0]["irreversible"] is True
+        client.post(f"/approvals/{pending[0]['id']}/decision", headers=tokens["approver"], json={"approve": False})
+    finally:
+        client.delete(f"/policies/{created.json()['id']}", headers=tokens["admin"])
+
+
+def test_always_allow_is_only_offered_to_admins(client, tokens):
+    from governai import engine
+    from governai.planner import step
+
+    with session_scope() as session:
+        owner = session.query(Run).first().owner_id
+    plan = [step("http_request", {"url": f"{settings.portal_url}/api/claims", "method": "POST", "body": {"items": [], "amount": 1}}, "post")]
+    run_id = engine.create_run(owner, "post a draft claim", [], forged_plan=plan)
+    run = wait(client, tokens["admin"], run_id, {"awaiting_approval"})
+    assert run["approvals"][0]["scopes"] == ["once", "task", "always"]
+    assert run["approvals"][0]["grant_target"] == f"POST requests to {settings.portal_host}"
+    approver_view = client.get(f"/runs/{run_id}", headers=tokens["approver"]).json()["approvals"][0]
+    assert approver_view["scopes"] == ["once", "task"]
+    client.post(f"/approvals/{approver_view['id']}/decision", headers=tokens["approver"], json={"approve": False})
+
+
+def test_api_refuses_allow_rules_on_irreversible_or_unknown_tools(client, tokens):
+    for tool in ("submit_form", "submit_claim", "made_up_tool"):
+        response = client.post("/policies", headers=tokens["admin"], json={
+            "name": "Unlock it", "effect": "allow", "match": {"tools": [tool]}, "conditions": []})
+        assert response.status_code == 422, tool
+
+
+def test_existing_database_gets_the_new_column(client):
+    from sqlalchemy import inspect, text
+    from governai.db import engine as db_engine, init_db
+
+    with db_engine.begin() as connection:
+        connection.execute(text("ALTER TABLE approvals DROP COLUMN scope"))
+    init_db()
+    assert "scope" in {c["name"] for c in inspect(db_engine).get_columns("approvals")}

@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 
 from . import audit, policy
 from .config import settings
-from .db import Approval, AuditEvent, Run, ToolCall, User, session_scope, utcnow
+from .db import Approval, AuditEvent, Policy, Run, TaskGrant, ToolCall, User, session_scope, utcnow
 from .planner import UnsupportedTask, make_plan, validate_plan
 from .security import decrypt, encrypt, mask_for_review, redact, stable_hash
 from .tools import REGISTRY, NeedsInput, RecoverableToolError, ToolContext, ToolFailure
@@ -134,12 +134,21 @@ def invoke_tool(run_id: str, index: int, step: dict, ctx: dict, actor: dict) -> 
 
     if decision.effect == "require_approval":
         approval_id = _consume_approval(run_id, index, name, args_hash, decision.required_role)
-        if approval_id is None:
-            _request_approval(run_id, index, tool, inputs, args, args_hash, decision, call_id)
-            raise AwaitingApproval()
-        with session_scope() as session:
-            session.get(ToolCall, call_id).approval_id = approval_id
-        audit.record("approval.consumed", actor_name, run_id, call_id, approval_id=approval_id, tool=name)
+        if approval_id is not None:
+            with session_scope() as session:
+                session.get(ToolCall, call_id).approval_id = approval_id
+            audit.record("approval.consumed", actor_name, run_id, call_id, approval_id=approval_id, tool=name)
+        else:
+            grant = _find_task_grant(run_id, tool, args, decision.required_role)
+            if grant is None:
+                _request_approval(run_id, index, tool, inputs, args, args_hash, decision, call_id)
+                raise AwaitingApproval()
+            with session_scope() as session:
+                call = session.get(ToolCall, call_id)
+                call.reasons = [*decision.reasons, {
+                    "policy_id": None, "policy": "Allowed for this task", "effect": "allow", "grant_id": grant["id"],
+                    "why": f"{grant['granted_by']} allowed this for the rest of the task."}]
+            audit.record("grant.used", actor_name, run_id, call_id, grant_id=grant["id"], tool=name)
 
     return _execute(tool, inputs, run_id, call_id, actor)
 
@@ -165,13 +174,68 @@ def _consume_approval(run_id: str, index: int, tool: str, args_hash: str, requir
     return None
 
 
+def _grant_key(args: dict) -> tuple[str | None, str | None]:
+    method = args.get("method")
+    return policy.host_of(args.get("url")), method.upper() if isinstance(method, str) else None
+
+
+def _find_task_grant(run_id: str, tool, args: dict, required_role: str) -> dict | None:
+    if tool.tags & policy.IRREVERSIBLE_TAGS:
+        return None
+    host, method = _grant_key(args)
+    with session_scope() as session:
+        grants = session.scalars(select(TaskGrant).where(
+            TaskGrant.run_id == run_id, TaskGrant.tool == tool.name,
+            TaskGrant.host.is_(host) if host is None else TaskGrant.host == host,
+            TaskGrant.method.is_(method) if method is None else TaskGrant.method == method,
+        )).all()
+        for grant in grants:
+            if policy.ROLE_RANK.get(grant.required_role, 0) >= policy.ROLE_RANK.get(required_role, 2):
+                return {"id": grant.id, "granted_by": grant.granted_by}
+    return None
+
+
+def approval_scopes(approval: Approval) -> list[str]:
+    """Which ways of saying yes this request offers. Irreversible actions are
+    decided one at a time. "Always" only replaces the default prompt, because an
+    explicit ask rule outranks allow rules and a standing yes would have no effect."""
+    tool = REGISTRY.get(approval.tool)
+    if tool is None or tool.tags & policy.IRREVERSIBLE_TAGS:
+        return ["once"]
+    scopes = ["once", "task"]
+    if all(reason.get("policy_id") is None for reason in approval.reasons):
+        scopes.append("always")
+    return scopes
+
+
+def grant_target(approval: Approval) -> str:
+    """Plain description of what a wider approval would cover."""
+    host, method = _grant_key(decrypt(approval.review_enc, {}))
+    target = f"{method} requests" if method else approval.tool
+    return f"{target} to {host}" if host else target
+
+
+def _standing_rule(approval: Approval, username: str) -> Policy:
+    args = decrypt(approval.review_enc, {})
+    host, method = _grant_key(args)
+    conditions = []
+    if host:
+        conditions.append({"field": "args.url", "op": "domain_in", "value": [host]})
+    if method:
+        conditions.append({"field": "args.method", "op": "eq", "value": args["method"]})
+    target = grant_target(approval)
+    return Policy(name=f"Always allow {target}", effect="allow", match={"tools": [approval.tool]}, conditions=conditions,
+                  description=f"{username} chose \"Always allow\" while reviewing a request. Hard denies still apply.",
+                  created_by=username)
+
+
 def _request_approval(run_id, index, tool, inputs, args, args_hash, decision, call_id) -> None:
     with session_scope() as session:
         approval = Approval(
             run_id=run_id, step_index=index, tool=tool.name, args_hash=args_hash,
             review_enc=encrypt(mask_for_review(args)),
             summary=tool.summarize(inputs) if tool.summarize else f"Run {tool.name}",
-            consequences=tool.consequences(inputs) if tool.consequences else "This action may be irreversible.",
+            consequences=tool.consequences(inputs) if tool.consequences else f"The agent runs {tool.name} with the values shown.",
             risk=decision.risk, reasons=decision.reasons, required_role=decision.required_role,
         )
         session.add(approval)
@@ -417,7 +481,7 @@ def retry_run(run_id: str, user: dict) -> None:
         _pool.submit(_work, run_id)
 
 
-def decide_approval(approval_id: str, user: dict, approve: bool, note: str | None = None) -> dict:
+def decide_approval(approval_id: str, user: dict, approve: bool, note: str | None = None, scope: str = "once") -> dict:
     with session_scope() as session:
         approval = session.get(Approval, approval_id)
         if approval is None:
@@ -429,15 +493,30 @@ def decide_approval(approval_id: str, user: dict, approve: bool, note: str | Non
             raise Forbidden(f"This action needs authorization from the {approval.required_role} role")
         if run.owner_id == user["id"]:
             raise Forbidden("You can't approve a task you started yourself")
+        if approve and scope not in approval_scopes(approval):
+            raise BadRequest(f"This action can't be approved with the scope '{scope}'")
+        if approve and scope == "always" and user["role"] != "admin":
+            raise Forbidden("Only an administrator can choose Always allow")
         result = session.execute(
             update(Approval).where(Approval.id == approval_id, Approval.status == "pending").values(
-                status="approved" if approve else "rejected", decided_by=user["username"], decided_at=utcnow(), note=note)
+                status="approved" if approve else "rejected", scope=scope if approve else None,
+                decided_by=user["username"], decided_at=utcnow(), note=note)
         )
         if result.rowcount != 1:
             raise BadRequest("This approval has already been decided")
         run_id = approval.run_id
+        rule_id = None
+        if approve and scope == "task":
+            host, method = _grant_key(decrypt(approval.review_enc, {}))
+            session.add(TaskGrant(run_id=run_id, approval_id=approval_id, tool=approval.tool, host=host, method=method,
+                                  required_role=approval.required_role, granted_by=user["username"]))
+        elif approve and scope == "always":
+            rule = _standing_rule(approval, user["username"])
+            session.add(rule)
+            session.flush()
+            rule_id = rule.id
     audit.record("approval.approved" if approve else "approval.rejected", f"user:{user['username']}", run_id,
-                 approval_id=approval_id, note=note, role=user["role"])
+                 approval_id=approval_id, note=note, role=user["role"], scope=scope if approve else None, policy_id=rule_id)
     if approve:
         if _claim(run_id, {"awaiting_approval"}, "running"):
             _pool.submit(_work, run_id)
@@ -496,7 +575,7 @@ def build_report(run_id: str) -> dict:
                 "deny": sum(c.decision == "deny" for c in calls),
             },
             "approvals": [
-                {"tool": a.tool, "status": a.status, "decided_by": a.decided_by, "required_role": a.required_role,
+                {"tool": a.tool, "status": a.status, "scope": a.scope, "decided_by": a.decided_by, "required_role": a.required_role,
                  "note": a.note, "decided_at": a.decided_at.isoformat() if a.decided_at else None} for a in approvals
             ],
             "audit_events": len(events),

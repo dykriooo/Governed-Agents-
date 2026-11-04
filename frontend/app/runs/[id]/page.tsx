@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState, type FormEvent } from "react";
-import { ApprovalCard, type Approval } from "@/components/approval";
+import { ApprovalCard, SCOPE_LABEL, type Approval } from "@/components/approval";
 import { useUser } from "@/components/shell";
 import { Badge, Button, Card, DecisionBadge, ErrorNote, Field, Json, RiskBadge, StatusBadge, inputClass } from "@/components/ui";
 import { api, formatTime, titleCase, usePolling } from "@/lib/api";
@@ -180,6 +180,7 @@ export default function RunPage() {
             {decided.map((a) => (
               <li key={a.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2">
                 <StatusBadge status={a.status} />
+                {a.scope && <span className="text-xs text-muted">{SCOPE_LABEL[a.scope]}</span>}
                 <span>{a.summary}</span>
                 <span className="text-muted">by {a.decided_by}, {formatTime(a.decided_at)}{a.note ? ` — “${a.note}”` : ""}</span>
               </li>

@@ -43,9 +43,10 @@ instruction → planner → plan check → engine ─┬→ invoke_tool: validat
 ```
 
 - **One gateway.** `engine.invoke_tool` is the only code that runs a tool. A forged plan still hits the same check at runtime.
-- **Rules only tighten.** Policies are data with `deny` or `require_approval` effects; there is no `allow`. In code, unknown tools are denied, high-risk tools always need approval, and a rule that can't be evaluated counts as triggered.
+- **Deny beats ask, and ask beats allow.** Custom rules name a tool, a condition and an effect. An allow rule can only remove the default prompt on a reversible high-risk action. In code, unknown tools are denied, and a deny or ask rule that can't be evaluated counts as triggered, while an allow rule that can't be evaluated doesn't match.
+- **Irreversible actions are decided one at a time.** Submissions and payments only offer *Allow once*. The API refuses wider approvals and allow rules for them, and the engine ignores any such rule that reaches the database another way.
 - **Hard denies can't be approved.** A deny never creates an approval request. Locked policies can't be disabled or deleted.
-- **Approvals are narrow.** Each is bound to a hash of the exact arguments, used once, and needs the authority policy requires at execution time. You can't approve your own task. Payments over ₹5,000 need an administrator.
+- **Approvals are narrow.** *Allow once* is bound to a hash of the exact arguments and used once. *Allow for this task* covers later calls with the same tool, host and method in that task. *Always allow* is admin-only, creates a removable allow rule, and is offered only when the prompt came from the default rather than an ask rule. Every option needs the authority policy requires at execution time. You can't approve your own task. Payments over ₹5,000 need an administrator.
 - **Submission re-checks the source.** The submit tools compare the portal's current record with what was approved, and refuse if it changed.
 - **Untrusted content has no path to the plan.** The model sees only the instruction and tool catalog. Document extraction is local and deterministic, so applicant data never goes to an LLM provider.
 - **The browser is fenced.** Every request a page makes is checked against the allowlist, which covers redirects and embedded resources that a per-call check never sees.
@@ -58,7 +59,7 @@ instruction → planner → plan check → engine ─┬→ invoke_tool: validat
 cd backend && uv run pytest
 ```
 
-The tests run the real engine and browser against the portal over HTTP. The evaluation suite (`governai/evaluation.py`, also on the **Evaluation** page) has 16 scenarios. It checks results against the portal's own records and a canary server standing in for an attacker, not against the agent's logs. Its numbers describe that suite on the mock portal, not production performance.
+The tests run the real engine and browser against the portal over HTTP. The evaluation suite (`governai/evaluation.py`, also on the **Evaluation** page) has 19 scenarios. It checks results against the portal's own records and a canary server standing in for an attacker, not against the agent's logs. Its numbers describe that suite on the mock portal, not production performance.
 
 ## Configuration
 

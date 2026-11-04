@@ -1,13 +1,18 @@
-"""Policy engine. Rules are data and can only tighten behaviour: there is no
-"allow" effect, so no configuration can loosen the code-level floor below.
+"""Policy engine. Rules are data with three effects: deny, require_approval (ask)
+and allow. Precedence is deny > ask > allow, so an allow rule can only remove the
+default prompt on a reversible high-risk action. It can never override a deny or
+an ask rule.
 
 Floor (not configurable):
   * unknown tools are denied;
-  * high-risk tools always need human approval;
-  * a rule that cannot be evaluated counts as triggered (fail closed).
+  * irreversible actions (submissions, payments) always need human approval, and
+    no allow rule or standing grant can change that;
+  * other high-risk tools need approval unless a specific allow rule matches;
+  * a deny or ask rule that cannot be evaluated counts as triggered (fail closed),
+    while an allow rule that cannot be evaluated does not match (also fail closed).
 
-Precedence: deny > require_approval > allow. A deny never creates an approval
-request, so hard-deny policies cannot be overridden by a human approver.
+A deny never creates an approval request, so hard-deny policies cannot be
+overridden by a human approver.
 """
 import json
 import re
@@ -22,7 +27,9 @@ from .db import Policy, session_scope
 from .security import contains_pii
 
 ROLE_RANK = {"approver": 1, "admin": 2}
-OPS = {"gt", "gte", "eq", "ne", "domain_not_in", "contains_pii", "not_actor"}
+OPS = {"gt", "gte", "lte", "eq", "ne", "domain_in", "domain_not_in", "contains_pii", "not_actor"}
+ALLOW_OPS = {"eq", "lte", "domain_in"}  # an allow rule must name what it permits
+IRREVERSIBLE_TAGS = {"submission", "payment"}
 
 
 @dataclass
@@ -88,10 +95,14 @@ def _triggered(condition: dict, scope: dict, preflight: bool) -> bool:
             return _number(value) > _number(condition["value"])
         if op == "gte":
             return _number(value) >= _number(condition["value"])
+        if op == "lte":
+            return _number(value) <= _number(condition["value"])
         if op == "eq":
             return value == condition["value"]
         if op == "ne":
             return value != condition["value"]
+        if op == "domain_in":
+            return domain_allowed(value, condition["value"])
         if op == "domain_not_in":
             return not domain_allowed(value, condition["value"])
         if op == "contains_pii":
@@ -99,6 +110,25 @@ def _triggered(condition: dict, scope: dict, preflight: bool) -> bool:
         return value != scope["actor"]["id"]  # not_actor
     except (KeyError, TypeError, ValueError):
         return True
+
+
+def _allow_matches(rule: Policy, scope: dict) -> bool:
+    """Strict, unlike _triggered: anything unknown or unreadable means no match."""
+    for condition in rule.conditions or []:
+        found, value = _lookup(condition.get("field", ""), scope)
+        if not found or is_unresolved(value) or condition.get("op") not in ALLOW_OPS:
+            return False
+        try:
+            op = condition["op"]
+            if op == "eq" and value != condition["value"]:
+                return False
+            if op == "lte" and not _number(value) <= _number(condition["value"]):
+                return False
+            if op == "domain_in" and not domain_allowed(value, condition["value"]):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
 
 
 def _applies(rule: Policy, tool: str, tags: set[str]) -> bool:
@@ -116,10 +146,17 @@ def load_rules() -> list[Policy]:
 
 def evaluate(tool: str, tags: set[str], risk: str, args: dict, actor: dict, preflight: bool = False) -> Decision:
     scope = {"args": args, "actor": actor, "tool": tool, "risk": risk}
-    denies, approvals = [], []
+    denies, approvals, allows = [], [], []
     required_role = "approver"
     for rule in load_rules():
         if not _applies(rule, tool, tags):
+            continue
+        if rule.effect == "allow":
+            # Checked here as well as when rules are saved, so a rule that reached
+            # the database some other way still can't unlock an irreversible action.
+            if tool in (rule.match or {}).get("tools", []) and not tags & IRREVERSIBLE_TAGS and _allow_matches(rule, scope):
+                allows.append({"policy_id": rule.id, "policy": rule.name, "effect": "allow", "hard": False,
+                               "allow_rule": True, "why": rule.description or "Allowed by a standing rule."})
             continue
         # All conditions must hold for a rule to fire.
         if rule.conditions and not all(_triggered(c, scope, preflight) for c in rule.conditions):
@@ -133,6 +170,8 @@ def evaluate(tool: str, tags: set[str], risk: str, args: dict, actor: dict, pref
                 required_role = rule.required_role
     if denies:
         return Decision("deny", risk, denies)
+    if risk == "high" and not approvals and allows:
+        return Decision("allow", risk, allows)
     if risk == "high" and not approvals:
         approvals.append(
             {"policy_id": None, "policy": "High-risk floor", "effect": "require_approval", "hard": False,
@@ -237,12 +276,21 @@ def compile_with_llm(text: str, client_call) -> dict | None:
         rule = json.loads(raw)
     except (TypeError, ValueError):
         return None
-    return rule if validate_rule(rule) is None else None
+    # Standing permission is only ever granted by a person, never by translation.
+    return rule if rule.get("effect") != "allow" and validate_rule(rule) is None else None
 
 
 def validate_rule(rule: dict) -> str | None:
-    if rule.get("effect") not in {"deny", "require_approval"}:
-        return "effect must be 'deny' or 'require_approval'"
+    if rule.get("effect") not in {"deny", "require_approval", "allow"}:
+        return "effect must be 'deny', 'require_approval' or 'allow'"
+    if rule.get("effect") == "allow":
+        match = rule.get("match") or {}
+        if not match.get("tools") or match.get("tags"):
+            return "An allow rule must name specific tools"
+        if rule.get("hard"):
+            return "An allow rule can't be a hard rule"
+        if any(isinstance(c, dict) and c.get("op") not in ALLOW_OPS for c in rule.get("conditions") or []):
+            return f"An allow rule can only use these conditions: {', '.join(sorted(ALLOW_OPS))}"
     if rule.get("required_role", "approver") not in ROLE_RANK:
         return "required_role must be 'approver' or 'admin'"
     if not isinstance(rule.get("match", {}), dict):
@@ -253,9 +301,9 @@ def validate_rule(rule: dict) -> str | None:
     for condition in conditions:
         if not isinstance(condition, dict) or condition.get("op") not in OPS or not condition.get("field"):
             return f"invalid condition: {condition}"
-        if condition["op"] == "domain_not_in" and not isinstance(condition.get("value"), list):
-            return "domain_not_in needs a list of domains"
-        if condition["op"] in {"gt", "gte"}:
+        if condition["op"] in {"domain_in", "domain_not_in"} and not isinstance(condition.get("value"), list):
+            return f"{condition['op']} needs a list of domains"
+        if condition["op"] in {"gt", "gte", "lte"}:
             try:
                 float(condition.get("value"))
             except (TypeError, ValueError):
