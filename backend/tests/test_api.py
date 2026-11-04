@@ -226,7 +226,7 @@ def test_an_approval_authorizes_only_one_execution(client, tokens):
     assert engine._consume_approval(run_id, step_index, "submit_form", args_hash, "approver") is None
 
 
-def test_custom_ask_rule_offers_task_scope_but_not_always(client, tokens):
+def test_custom_ask_rule_offers_every_scope_but_always_is_admin_only(client, tokens):
     created = client.post("/policies", headers=tokens["admin"], json={
         "name": "Ask before filling forms", "effect": "require_approval", "match": {"tools": ["fill_form"]}, "conditions": []})
     assert created.status_code == 201, created.text
@@ -235,9 +235,9 @@ def test_custom_ask_rule_offers_task_scope_but_not_always(client, tokens):
         run = wait(client, tokens["student"], run_id, {"awaiting_approval"})
         assert run["approvals"][0]["tool"] == "fill_form"
         admin_view = client.get(f"/runs/{run_id}", headers=tokens["admin"]).json()["approvals"][0]
-        assert admin_view["scopes"] == ["once", "task"]  # an ask rule outranks allow rules, so "always" would do nothing
+        assert admin_view["scopes"] == ["once", "task", "always"]
         decide = f"/approvals/{admin_view['id']}/decision"
-        assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "always"}).status_code == 409
+        assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "always"}).status_code == 403
         assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "bogus"}).status_code == 409
         assert client.post(decide, headers=tokens["approver"], json={"approve": True, "scope": "task"}).status_code == 200
         deadline = time.monotonic() + 30
@@ -247,7 +247,7 @@ def test_custom_ask_rule_offers_task_scope_but_not_always(client, tokens):
             run = client.get(f"/runs/{run_id}", headers=tokens["student"]).json()
             pending = [a for a in run["approvals"] if a["status"] == "pending"]
         assert pending and pending[0]["tool"] == "submit_form"
-        assert pending[0]["scopes"] == ["once"] and pending[0]["irreversible"] is True
+        assert pending[0]["scopes"] == ["once", "task"] and pending[0]["irreversible"] is True
         client.post(f"/approvals/{pending[0]['id']}/decision", headers=tokens["approver"], json={"approve": False})
     finally:
         client.delete(f"/policies/{created.json()['id']}", headers=tokens["admin"])

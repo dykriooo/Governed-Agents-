@@ -191,7 +191,7 @@ function RuleBuilder({ onCreated }: { onCreated: () => void }) {
       </Field>
       <p className="text-xs text-muted">
         {effect === "allow"
-          ? "Deny and ask rules still win over this. Submissions and payments aren't listed because they always need a person."
+          ? "Deny and ask rules still win over this. To allow submissions or payments, choose Always allow while reviewing one."
           : effect === "deny"
             ? "A deny can't be overridden by approval, and it wins over every other rule."
             : "An ask rule wins over allow rules. Only a deny outranks it."}
@@ -263,7 +263,7 @@ export default function PoliciesPage() {
   const { data, error, refresh } = usePolling<Rule[]>("/policies", 15000);
   return (
     <>
-      <PageTitle title="Policies" subtitle="Every tool call is checked against these rules before it runs. Deny beats ask, and ask beats allow. Submissions and payments always need a person's approval, whatever is configured here." />
+      <PageTitle title="Policies" subtitle="Every tool call is checked against these rules before it runs. Deny beats ask, and ask beats allow. Choosing Always allow during a review adds a rule here that waives the rules it was flagged by." />
       {isAdmin && <NewPolicy onCreated={refresh} />}
       <ErrorNote>{error}</ErrorNote>
       <div className="space-y-3">

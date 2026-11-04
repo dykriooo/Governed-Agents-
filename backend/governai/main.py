@@ -189,7 +189,7 @@ def _approval_row(approval: Approval, include_review: bool, user: dict, run: Run
     return {
         "scope": approval.scope,
         "scopes": [scope for scope in scopes if scope != "always" or user["role"] == "admin"],
-        "irreversible": scopes == ["once"],
+        "irreversible": engine.is_irreversible(approval.tool),
         "grant_target": engine.grant_target(approval),
         "id": approval.id, "run_id": approval.run_id, "tool": approval.tool, "summary": approval.summary,
         "consequences": approval.consequences, "risk": approval.risk, "reasons": approval.reasons,
@@ -286,7 +286,7 @@ def _rule_problem(values: dict) -> str | None:
     if unknown := [name for name in named if name not in REGISTRY]:
         return f"Unknown tool: {', '.join(unknown)}"
     if values.get("effect") == "allow" and any(REGISTRY[name].tags & policy.IRREVERSIBLE_TAGS for name in named):
-        return "Submissions and payments can't be always allowed. They need a person's approval every time."
+        return "A rule can't allow submissions or payments. Choose Always allow while reviewing one instead."
     return None
 
 

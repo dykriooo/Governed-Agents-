@@ -1,12 +1,13 @@
 """Policy engine. Rules are data with three effects: deny, require_approval (ask)
-and allow. Precedence is deny > ask > allow, so an allow rule can only remove the
-default prompt on a reversible high-risk action. It can never override a deny or
-an ask rule.
+and allow. Precedence is deny > ask > allow. An allow rule removes the default
+prompt on a high-risk action. It never overrides a deny, and it only overrides the
+specific ask rules a person waived by choosing "Always allow" during a review.
 
 Floor (not configurable):
   * unknown tools are denied;
-  * irreversible actions (submissions, payments) always need human approval, and
-    no allow rule or standing grant can change that;
+  * irreversible actions (submissions, payments) need human approval unless a
+    person granted wider permission during a review; rules written any other way
+    can't unlock them;
   * other high-risk tools need approval unless a specific allow rule matches;
   * a deny or ask rule that cannot be evaluated counts as triggered (fail closed),
     while an allow rule that cannot be evaluated does not match (also fail closed).
@@ -147,14 +148,18 @@ def load_rules() -> list[Policy]:
 def evaluate(tool: str, tags: set[str], risk: str, args: dict, actor: dict, preflight: bool = False) -> Decision:
     scope = {"args": args, "actor": actor, "tool": tool, "risk": risk}
     denies, approvals, allows = [], [], []
+    waived: set[str] = set()
     required_role = "approver"
     for rule in load_rules():
         if not _applies(rule, tool, tags):
             continue
         if rule.effect == "allow":
+            match = rule.match or {}
             # Checked here as well as when rules are saved, so a rule that reached
             # the database some other way still can't unlock an irreversible action.
-            if tool in (rule.match or {}).get("tools", []) and not tags & IRREVERSIBLE_TAGS and _allow_matches(rule, scope):
+            permitted = not tags & IRREVERSIBLE_TAGS or match.get("approval_id")
+            if tool in match.get("tools", []) and permitted and _allow_matches(rule, scope):
+                waived.update(match.get("waives") or [])
                 allows.append({"policy_id": rule.id, "policy": rule.name, "effect": "allow", "hard": False,
                                "allow_rule": True, "why": rule.description or "Allowed by a standing rule."})
             continue
@@ -170,8 +175,10 @@ def evaluate(tool: str, tags: set[str], risk: str, args: dict, actor: dict, pref
                 required_role = rule.required_role
     if denies:
         return Decision("deny", risk, denies)
-    if risk == "high" and not approvals and allows:
-        return Decision("allow", risk, allows)
+    # Any ask rule that wasn't specifically waived still applies, including new ones.
+    if allows and all(reason["policy_id"] in waived for reason in approvals):
+        if approvals or risk == "high":
+            return Decision("allow", risk, allows)
     if risk == "high" and not approvals:
         approvals.append(
             {"policy_id": None, "policy": "High-risk floor", "effect": "require_approval", "hard": False,

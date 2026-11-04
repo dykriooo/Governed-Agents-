@@ -180,8 +180,6 @@ def _grant_key(args: dict) -> tuple[str | None, str | None]:
 
 
 def _find_task_grant(run_id: str, tool, args: dict, required_role: str) -> dict | None:
-    if tool.tags & policy.IRREVERSIBLE_TAGS:
-        return None
     host, method = _grant_key(args)
     with session_scope() as session:
         grants = session.scalars(select(TaskGrant).where(
@@ -196,23 +194,28 @@ def _find_task_grant(run_id: str, tool, args: dict, required_role: str) -> dict 
 
 
 def approval_scopes(approval: Approval) -> list[str]:
-    """Which ways of saying yes this request offers. Irreversible actions are
-    decided one at a time. "Always" only replaces the default prompt, because an
-    explicit ask rule outranks allow rules and a standing yes would have no effect."""
-    tool = REGISTRY.get(approval.tool)
-    if tool is None or tool.tags & policy.IRREVERSIBLE_TAGS:
-        return ["once"]
-    scopes = ["once", "task"]
-    if all(reason.get("policy_id") is None for reason in approval.reasons):
-        scopes.append("always")
-    return scopes
+    """Which ways of saying yes this request offers."""
+    return ["once", "task", "always"] if approval.tool in REGISTRY else ["once"]
+
+
+def is_irreversible(tool_name: str) -> bool:
+    tool = REGISTRY.get(tool_name)
+    return tool is None or bool(tool.tags & policy.IRREVERSIBLE_TAGS)
 
 
 def grant_target(approval: Approval) -> str:
     """Plain description of what a wider approval would cover."""
-    host, method = _grant_key(decrypt(approval.review_enc, {}))
+    args = decrypt(approval.review_enc, {})
+    host, method = _grant_key(args)
     target = f"{method} requests" if method else approval.tool
-    return f"{target} to {host}" if host else target
+    target = f"{target} to {host}" if host else target
+    return f"{target}, up to ₹{args['amount']:,.2f}" if _capped(approval.tool, args) else target
+
+
+def _capped(tool_name: str, args: dict) -> bool:
+    """A standing yes to a payment covers amounts up to the one the person reviewed."""
+    tool = REGISTRY.get(tool_name)
+    return bool(tool and "payment" in tool.tags and isinstance(args.get("amount"), (int, float)))
 
 
 def _standing_rule(approval: Approval, username: str) -> Policy:
@@ -223,9 +226,15 @@ def _standing_rule(approval: Approval, username: str) -> Policy:
         conditions.append({"field": "args.url", "op": "domain_in", "value": [host]})
     if method:
         conditions.append({"field": "args.method", "op": "eq", "value": args["method"]})
+    if _capped(approval.tool, args):
+        conditions.append({"field": "args.amount", "op": "lte", "value": args["amount"]})
+    waives = [reason["policy_id"] for reason in approval.reasons if reason.get("policy_id")]
+    waived_names = [reason["policy"] for reason in approval.reasons if reason.get("policy_id")]
     target = grant_target(approval)
-    return Policy(name=f"Always allow {target}", effect="allow", match={"tools": [approval.tool]}, conditions=conditions,
-                  description=f"{username} chose \"Always allow\" while reviewing a request. Hard denies still apply.",
+    note = f" It waives: {', '.join(waived_names)}." if waived_names else ""
+    return Policy(name=f"Always allow {target}", effect="allow",
+                  match={"tools": [approval.tool], "waives": waives, "approval_id": approval.id}, conditions=conditions,
+                  description=f"{username} chose \"Always allow\" while reviewing a request.{note} Hard denies still apply.",
                   created_by=username)
 
 

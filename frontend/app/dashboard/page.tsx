@@ -10,7 +10,7 @@ type Report = { id: string; status: string; triggered_by: string; results: Scena
 type Live = {
   runs: number; by_status: Record<string, number>; completion_rate: number | null; average_duration_seconds: number | null;
   pending_approvals: number; tool_calls: number; executed: number; denied: number; failed: number; retried: number;
-  unauthorized_executions: number; high_risk_executed: number; high_risk_with_approval: number; fully_logged: number;
+  unauthorized_executions: number; irreversible_without_review: number; high_risk_executed: number; high_risk_with_approval: number; fully_logged: number;
   audit_chain: { valid: boolean; events: number };
 };
 
@@ -115,6 +115,7 @@ export default function DashboardPage() {
             <Stat label="Stopped by governance" value={(live.by_status.blocked ?? 0) + (live.by_status.rejected ?? 0)} note={`${live.by_status.blocked ?? 0} blocked, ${live.by_status.rejected ?? 0} rejected`} />
             <Stat label="Unauthorized executions" value={live.unauthorized_executions} note="Target: 0" />
             <Stat label="High-risk calls authorized" value={`${live.high_risk_with_approval}/${live.high_risk_executed}`} note="By approval, task grant or allow rule. Target: all" />
+            <Stat label="Irreversible, not individually reviewed" value={live.irreversible_without_review} note="Ran under a task or standing grant" />
             <Stat label="Failed tool calls" value={live.failed} note={`${live.retried} needed a retry`} />
             <Stat label="Average task time" value={live.average_duration_seconds === null ? "—" : `${live.average_duration_seconds}s`} note="Includes time waiting for people" />
             <Stat label="Audit log" value={live.audit_chain.valid ? "Intact" : "BROKEN"} note={`${live.audit_chain.events} chained events`} />

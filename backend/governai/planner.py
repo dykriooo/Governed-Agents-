@@ -41,7 +41,7 @@ def admission_steps(extras: list[dict]) -> list[dict]:
         step("validate_form", {"url": url, "application_id": "$ctx.draft.application_id", "fields": fields},
              "Check the saved draft against the intended values", "validation"),
         step("submit_form", {"url": url, "application_id": "$ctx.draft.application_id", "fields": fields},
-             "Submit the application (requires human approval)", "receipt"),
+             "Submit the application", "receipt"),
         step("memory_store", {"owner_id": "$actor.id", "values": fields},
              "Remember non-sensitive preferences for next time", "memory_saved"),
         step("generate_report", {}, "Produce the execution report", "report"),
@@ -58,7 +58,7 @@ def expense_steps(extras: list[dict]) -> list[dict]:
              "Categorize, check company policy, calculate the reimbursement", "claim"),
         step("prepare_claim", {"url": url, "claim": "$ctx.claim"}, "Prepare the reimbursement claim", "draft"),
         step("submit_claim", {"url": url, "claim_id": "$ctx.draft.claim_id", "amount": "$ctx.claim.amount"},
-             "Submit the claim (requires human approval)", "receipt"),
+             "Submit the claim", "receipt"),
         step("generate_report", {}, "Produce the audit record", "report"),
     ]
 

@@ -79,13 +79,14 @@ export function ApprovalCard({ approval, onDecided, requester }: { approval: App
             {approval.scopes.includes("always") && <Button disabled={busy} variant="secondary" onClick={() => decide(true, "always")}>Always allow</Button>}
             <Button disabled={busy} variant="danger" onClick={() => decide(false)}>Reject</Button>
           </div>
-          {approval.irreversible ? (
-            <p className="text-xs text-muted">This can't be undone, so it's approved one at a time.</p>
-          ) : (
-            <p className="text-xs text-muted">
-              Wider options cover <span className="font-medium">{approval.grant_target}</span>.
-              {approval.scopes.includes("always") && " Always allow adds a rule you can remove on the Policies page."}
-              {" "}Hard denies still apply.
+          <p className="text-xs text-muted">
+            Wider options cover <span className="font-medium">{approval.grant_target}</span>.
+            {approval.scopes.includes("always") && " Always allow adds a rule you can remove on the Policies page."}
+            {" "}Hard denies still apply.
+          </p>
+          {approval.irreversible && (
+            <p className="text-xs font-medium text-warn">
+              This action can't be undone. With a wider option, matching actions run without anyone reviewing them first.
             </p>
           )}
         </div>
