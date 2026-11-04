@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --canvas: 246 245 241;
+  --surface: 255 255 255;
+  --sunken: 240 238 232;
+  --line: 222 219 210;
+  --ink: 28 30 33;
+  --muted: 100 103 108;
+  --accent: 28 66 112;
+  --accent-ink: 255 255 255;
+  --good: 22 112 72;
+  --warn: 150 88 0;
+  --bad: 176 42 42;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --canvas: 20 21 23;
+    --surface: 29 31 34;
+    --sunken: 24 25 28;
+    --line: 56 58 63;
+    --ink: 234 234 230;
+    --muted: 160 162 166;
+    --accent: 138 178 226;
+    --accent-ink: 16 24 36;
+    --good: 88 196 142;
+    --warn: 228 170 80;
+    --bad: 240 120 112;
+  }
+}
+
+body {
+  background: rgb(var(--canvas));
+  color: rgb(var(--ink));
+}
+
+:focus-visible {
+  outline: 2px solid rgb(var(--accent));
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

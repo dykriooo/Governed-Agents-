@@ -1,0 +1,7 @@
+Student Profile
+
+Full Name: Asha Raman
+Date of Birth: 2001-03-14
+Email: asha.raman@example.com
+Phone: +91 98765 43210
+National ID: 4821 7730 1956

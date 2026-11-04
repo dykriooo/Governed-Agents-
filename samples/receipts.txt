@@ -1,0 +1,6 @@
+Expense receipts - Client visit, Bengaluru
+
+Expense: Airport taxi | 1200 | travel
+Expense: Client dinner | 2400 | meals
+Expense: Hotel, one night | 3800 | lodging
+Expense: Minibar | 650 | alcohol
